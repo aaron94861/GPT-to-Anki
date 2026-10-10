@@ -60,6 +60,21 @@ class SingleReplyTests(unittest.TestCase):
             cards = g.build_cards("**Endocarditis – %s**\n\ntext\n" % heading)
             self.assertEqual([c["front"] for c in cards], [front], heading)
 
+    def test_bold_title_with_inner_markdown_headings(self):
+        text = ("**Endocarditis – Diagnosis**\n\n### Classification\n- Duke\n\n### Key points\n- Echo\n")
+        cards = g.build_cards(text)
+        self.assertEqual([c["front"] for c in cards], ["Diagnosis?"])
+        self.assertIn("<b>Key points</b>", cards[0]["back"])
+        self.assertIn("Echo", cards[0]["back"])
+
+    def test_several_replies_pasted_together(self):
+        sections = ["Definition", "Aetiology and classification", "Pathogenesis",
+                    "Physical examination and signs and symptoms", "Diagnosis", "Management and treatment"]
+        text = "".join("**Endocarditis – %s**\n\nText\n\n### Diagnosis\n- a\n\n" % s for s in sections)
+        cards = g.build_cards(text)
+        self.assertEqual([c["front"] for c in cards], FRONTS)
+        self.assertTrue(all(c["back"].count("Endocarditis – ") == 1 for c in cards))
+
     def test_inner_bold_dash_line_is_content(self):
         text = ("**Endocarditis – Diagnosis**\n\n**Duke criteria – Major**\n- Positive blood cultures\n"
                 "**Duke criteria – Minor**\n- Fever\n")

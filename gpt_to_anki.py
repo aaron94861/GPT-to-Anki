@@ -226,16 +226,18 @@ def parse(text, topic=None):
         if kind == "combined" and c[3] not in SECTION_ORDER and cur_chunk is not None:
             kind = None  # "Duke criteria – Major" inside a reply is content, not a new card
 
-        if kind == "combined" and can_switch:
+        # A known "Disease – Section" title always starts a new card, so several copied
+        # replies pasted one after another split correctly whatever their heading levels.
+        if kind == "combined" and (can_switch or c[3] in SECTION_ORDER):
             _, level, t, section, title = c
             cur_topic = topic or t
             cur_chunk = open_chunk(cur_topic, section, section, title)
             cur_level, titled = level, True
             continue
 
-        # Inside a titled reply, e.g. "Endocarditis – Aetiology and classification", sub-headings
-        # like "Classification" or "Causes" belong to that card unless they are a level higher.
-        if kind == "section" and titled and level >= cur_level:
+        # Inside a titled reply, e.g. "Endocarditis – Aetiology and classification", any other
+        # heading ("### Classification", "### Key points") is part of that card's answer.
+        if titled and kind == "section" or titled and kind == "topic" and level != 0:
             kind = None
 
         if kind == "section" and can_switch:
