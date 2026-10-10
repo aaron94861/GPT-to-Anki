@@ -1,32 +1,28 @@
 #!/usr/bin/env python3
 """
-gpt_to_anki.py - turn a ChatGPT answer into Anki cards, one card per section.
+gpt_to_anki.py - turn ChatGPT answers into Anki cards, one card per section.
 
-A ChatGPT answer like:
+Typical use (watch mode):
+    1. Run:  python gpt_to_anki.py --watch
+    2. In ChatGPT, click the Copy button under a reply titled e.g.
+           "Endocarditis – Definition"
+    3. The script adds a card to the existing subdeck ...::Endocarditis
+           Front: Definition?
+           Back:  the copied reply (formatting kept)
+    4. Copy the next reply ("Endocarditis – Aetiology", ...) and so on.
 
-    # Acute Pancreatitis
-    ## Definition
-    Acute inflammation of the pancreas ...
-    ## Etiology
-    - Gallstones
-    - Alcohol
-    ...
-
-becomes Basic cards in your chosen deck:
-
-    Front: Acute Pancreatitis - Definition     Back: Acute inflammation of ...
-    Front: Acute Pancreatitis - Etiology       Back: * Gallstones * Alcohol
-    ...
+It also understands one big reply holding every section:
+    # Endocarditis
+    ## Definition ...
+    ## Aetiology ...
 
 Cards are sent straight into Anki through the AnkiConnect add-on
 (https://ankiweb.net/shared/info/2055492159). Anki must be open.
 
-Usage examples:
-    python gpt_to_anki.py --deck "Medicine::IM"            # paste, then Ctrl-D / Ctrl-Z+Enter
-    python gpt_to_anki.py --deck "Medicine::IM" --clipboard
-    python gpt_to_anki.py --deck "Medicine::IM" --watch    # copy in ChatGPT -> cards appear
-    python gpt_to_anki.py notes.md --dry-run               # preview, send nothing
-    python gpt_to_anki.py notes.md --tsv cards.tsv         # file for File > Import instead
+Other examples:
+    python gpt_to_anki.py --clipboard                  # add what's on the clipboard once
+    python gpt_to_anki.py answer.md --dry-run          # preview, send nothing
+    python gpt_to_anki.py answer.md --tsv cards.tsv    # file for File > Import instead
 """
 
 import argparse
@@ -39,56 +35,68 @@ import time
 import urllib.error
 import urllib.request
 
-# ---------------------------------------------------------------------------
-# Sections: each entry is one card. Edit names / aliases / order freely.
-# The first value is the label printed on the card front; the aliases are the
-# headings ChatGPT might use for it (case-insensitive, "&" == "and").
-# Several headings may map to one card - their text is merged under subheadings.
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# YOUR SETTINGS - change these once, then you never need command-line options.
+# ===========================================================================
+NOTE_TYPE = "Syllabus Topic Prompt"   # Anki note type (Tools > Manage Note Types); falls back to "Basic"
+FRONT_FIELD = "Front"
+BACK_FIELD = "Back"
+FRONT_TEMPLATE = "{section}?"          # e.g. "Definition?"  ({topic} = disease name)
+INCLUDE_TITLE_ON_BACK = True           # keep "Endocarditis – Definition" as the back's heading
+PARENT_DECK = ""                       # where NEW disease subdecks go, e.g. "Internal Medicine::Cardiology"
+                                       # (existing subdecks like ...::Endocarditis are found automatically)
+TAGS = ""                              # e.g. "chatgpt"
+
+# One entry per card type: (text used on the card front, headings ChatGPT may use for it).
+# Matching ignores case, "&" == "and", and US/UK spelling where listed.
 SECTIONS = [
     ("Definition", [
-        "definition", "definitions", "define", "overview", "what is it",
+        "definition", "definitions", "define", "overview",
     ]),
-    ("Etiology", [
-        "etiology", "aetiology", "etiology and risk factors", "causes",
-        "causes and risk factors", "risk factors", "etiologies",
+    ("Aetiology and classification", [
+        "aetiology and classification", "etiology and classification",
+        "classification and aetiology", "classification and etiology",
+        "aetiology", "etiology", "aetiologies", "etiologies", "causes",
+        "aetiology and risk factors", "etiology and risk factors",
+        "causes and risk factors", "risk factors",
+        "classification", "classifications", "types", "subtypes",
+        "classification and causes", "causes and classification",
     ]),
     ("Pathogenesis", [
         "pathogenesis", "pathophysiology", "pathogenesis and pathophysiology",
         "pathophysiology and pathogenesis", "mechanism",
     ]),
-    ("Physical Examination & Signs and Symptoms", [
+    ("Physical examination and signs and symptoms", [
         "physical examination and signs and symptoms",
         "physical examination, signs and symptoms",
         "physical exam and signs and symptoms",
         "physical exam, signs and symptoms",
         "signs and symptoms and physical examination",
         "signs, symptoms and physical examination",
+        "signs and symptoms and physical exam",
+        "clinical features and physical examination",
         "signs and symptoms", "symptoms and signs", "signs", "symptoms",
         "physical examination", "physical exam", "physical examination findings",
-        "physical exam findings", "exam findings", "clinical features",
-        "clinical presentation", "presentation", "history and physical",
+        "physical exam findings", "examination findings", "clinical features",
+        "clinical presentation", "clinical manifestations", "presentation",
     ]),
     ("Diagnosis", [
         "diagnosis", "diagnostics", "diagnostic workup", "diagnostic work-up",
         "workup", "work-up", "investigations", "diagnosis and workup",
-        "diagnosis and investigations", "labs and imaging",
+        "diagnosis and investigations", "diagnostic criteria",
     ]),
-    ("Management & Treatment", [
+    ("Management and treatment", [
         "management and treatment", "treatment and management", "management",
         "treatment", "therapy", "management and therapy",
     ]),
 ]
 
-DEFAULT_DECK = "Default"
-DEFAULT_MODEL = "Basic"
-DEFAULT_FRONT_TEMPLATE = "{topic} - {section}"
 ANKI_CONNECT_URL = "http://127.0.0.1:8765"
 
 
-# ---------------------------------------------------------------------------
-# Parsing
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Recognising headings
+# ===========================================================================
 def _norm(name):
     name = name.lower().replace("&", " and ")
     name = re.sub(r"[^a-z0-9,/ -]+", " ", name)
@@ -104,123 +112,167 @@ for _label, _aliases in SECTIONS:
         _ALIAS_TO_SECTION[_norm(_a)] = _label
         _ALIAS_TO_SECTION[_norm(_a).replace(",", "")] = _label
 
-_LEAD_RE = re.compile(r"^(?P<hashes>#{1,6}\s*)?(?P<marks>(?:[*_]{1,3}|\d+[.)]|[IVX]+[.)](?=\s))\s*)*")
+SECTION_ORDER = [label for label, _ in SECTIONS]
+PLAIN_LEVEL = 7  # "level" of bold / numbered / "Name:" headings (deeper than any "#")
+
+_LEAD_RE = re.compile(r"^(?P<hashes>#{1,6})?\s*(?P<marks>(?:[*_]{1,3}|\d+[.)]|[IVX]+[.)](?=\s))\s*)*")
+_BULLET_LINE_RE = re.compile(r"^\s*(?:[-+•▪●]|\*(?!\*))\s")
+_TOPIC_LINE_RE = re.compile(r"^\s*[*_]{0,3}\s*(?:topic|disease|condition)\s*[*_]{0,3}\s*[:\-]\s*[*_]{0,3}\s*(?P<t>.+?)\s*[*_]{0,3}\s*$", re.I)
+_BOLD_ONLY_RE = re.compile(r"^\s*(?:\*\*|__)(?P<t>[^*_]+?)(?:\*\*|__)\s*:?\s*$")
+_TITLE_SPLIT_RE = re.compile(r"\s+[–—-]\s+|\s*:\s+|\s*\|\s*")
+_SECTION_OF_RE = re.compile(r"^(?P<s>.+?)\s+(?:of|in|for)\s+(?P<t>.+)$", re.I)
 
 
-def _split_heading(line):
-    """
-    Split a possible heading line into (name, inline_text, structural).
-    Handles "## Definition", "**Definition:** text", "1. Definition", "Definition: text".
-    structural is True when the line carries heading markup (#, bold, numbering, colon).
-    """
+def _lookup(name):
+    n = _norm(name)
+    return _ALIAS_TO_SECTION.get(n) or _ALIAS_TO_SECTION.get(n.replace(",", ""))
+
+
+def _clean(t):
+    return re.sub(r"[*_`#]+", "", t).strip().strip(":").strip()
+
+
+def _strip_lead(line):
+    """Remove "#", bold markers and numbering. Returns (text, level, has_markup)."""
     s = line.strip()
-    lead = _LEAD_RE.match(s)
-    structural = bool(lead.group(0))
-    s = s[lead.end():]
-    if ":" in s:
-        name, rest = s.split(":", 1)
-        structural = True
+    m = _LEAD_RE.match(s)
+    level = len(m.group("hashes")) if m.group("hashes") else PLAIN_LEVEL
+    return s[m.end():], level, bool(m.group(0).strip())
+
+
+def classify(line):
+    """
+    Work out whether a line is a heading. Returns one of
+        ("combined", level, topic, section, title)   "## Endocarditis – Definition"
+        ("section",  level, section, inline_text, heading_text)
+        ("topic",    level, topic)
+    or None for ordinary content.
+    """
+    if not line.strip() or _BULLET_LINE_RE.match(line):
+        return None
+
+    m = _TOPIC_LINE_RE.match(line)
+    if m:
+        return ("topic", 0, _clean(m.group("t")))
+
+    body, level, markup = _strip_lead(line)
+    body = body.strip()
+    is_md = level < PLAIN_LEVEL
+    is_bold_only = bool(_BOLD_ONLY_RE.match(line))
+    title = _clean(body)
+
+    # "Endocarditis – Definition", "Definition – Endocarditis", "Definition of Endocarditis"
+    if (is_md or is_bold_only) and len(title) <= 120:
+        parts = [p.strip() for p in _TITLE_SPLIT_RE.split(title) if p.strip()]
+        if len(parts) == 2:
+            a, b = parts
+            if _lookup(b) and not _lookup(a):
+                return ("combined", level, a, _lookup(b), title)
+            if _lookup(a) and not _lookup(b):
+                return ("combined", level, b, _lookup(a), title)
+            if not _lookup(a) and not _lookup(b) and not re.search(r"\d", b):
+                # unknown section name, e.g. "Endocarditis – Complications"
+                return ("combined", level, a, b[:1].upper() + b[1:], title)
+        m = _SECTION_OF_RE.match(title)
+        if m and _lookup(m.group("s")):
+            return ("combined", level, _clean(m.group("t")), _lookup(m.group("s")), title)
+
+    # "## Definition", "**Definition:** text", "1. Definition", "Definition: text"
+    if ":" in body:
+        name, rest = body.split(":", 1)
+        markup = True
     else:
-        name, rest = s, ""
+        name, rest = body, ""
     name = re.sub(r"\s*\([^)]*\)\s*", " ", name).strip(" *_")
     rest = rest.strip().strip("*_").strip()
-    return name, rest, structural
+    if name and len(name) <= 80 and _lookup(name) and (markup or not rest):
+        return ("section", level, _lookup(name), rest, _clean(name))
 
-
-_TOPIC_RE = re.compile(r"^\s*(?:[*_]{0,3})\s*(?:topic|disease|condition)\s*[:\-]\s*(?P<t>.+?)\s*(?:[*_]{0,3})\s*$", re.I)
-_MD_HEADING_RE = re.compile(r"^\s*#{1,6}\s+(?P<t>.+?)\s*#*\s*$")
-_BOLD_LINE_RE = re.compile(r"^\s*(?:\*\*|__)(?P<t>[^*_]+?)(?:\*\*|__)\s*:?\s*$")
-
-
-_BULLET_LINE_RE = re.compile(r"^\s*[-+*\u2022\u25aa\u25cf]\s")
-
-
-def match_section(line):
-    """Return (section_label, inline_text) if the line is a section heading, else None."""
-    if _BULLET_LINE_RE.match(line):  # "- Treatment: antibiotics" is content, not a heading
-        return None
-    name, rest, structural = _split_heading(line)
-    if not name or len(name) > 80:
-        return None
-    n = _norm(name)
-    label = _ALIAS_TO_SECTION.get(n) or _ALIAS_TO_SECTION.get(n.replace(",", ""))
-    if not label:
-        return None
-    if rest and not structural:
-        return None
-    return label, rest
-
-
-def match_topic(line):
-    """Return a topic name if the line looks like a non-section title, else None."""
-    m = _TOPIC_RE.match(line)
-    if m:
-        return _clean_title(m.group("t"))
-    for rx in (_MD_HEADING_RE, _BOLD_LINE_RE):
-        m = rx.match(line)
-        if m and not match_section(line):
-            return _clean_title(m.group("t"))
+    if is_md or is_bold_only:
+        return ("topic", level, title)
     return None
 
 
-def _clean_title(t):
-    t = re.sub(r"[*_`]+", "", t).strip().rstrip(":").strip()
-    return t
-
-
+# ===========================================================================
+# Parsing a whole paste
+# ===========================================================================
 def parse(text, topic=None):
     """
-    Split text into topics and sections.
-    Returns a list of (topic, {section_label: [(heading, [lines]), ...]}) in order of appearance.
-    A new markdown/bold title (or "Topic: X") that is not a section starts a new topic,
-    so one paste can hold several diseases.
+    Returns {topic: {section: [chunk, ...]}} in order of appearance, where a chunk is
+    {"heading": str, "title": str|None, "lines": [str]}.
+    A section can have several chunks, e.g. separate "Signs and symptoms" and
+    "Physical examination" headings that both belong on one card.
     """
-    results = []
+    results = {}
     cur_topic = topic
-    cur_sections = {}
-    cur_label = None
+    cur_chunk = None
+    cur_level = None      # heading level of the open section; deeper headings are content
+    titled = False        # open section came from a "Disease – Section" title
     preamble = []
 
-    def flush():
-        if cur_sections:
-            results.append((cur_topic, cur_sections))
+    def open_chunk(t, section, heading, title=None):
+        sections = results.setdefault(t, {})
+        chunk = {"heading": heading, "title": title, "lines": []}
+        sections.setdefault(section, []).append(chunk)
+        return chunk
 
     for raw in text.splitlines():
         line = raw.rstrip()
-        sec = match_section(line) if line.strip() else None
-        if sec:
-            label, inline = sec
-            heading_name = _clean_title(_split_heading(line)[0])
-            chunk = (heading_name, [inline] if inline else [])
-            cur_sections.setdefault(label, []).append(chunk)
-            cur_label = label
+        c = classify(line)
+        kind = c[0] if c else None
+        level = c[1] if c else None
+        can_switch = cur_level is None or (level is not None and level <= cur_level)
+
+        if kind == "combined" and c[3] not in SECTION_ORDER and cur_chunk is not None:
+            kind = None  # "Duke criteria – Major" inside a reply is content, not a new card
+
+        if kind == "combined" and can_switch:
+            _, level, t, section, title = c
+            cur_topic = topic or t
+            cur_chunk = open_chunk(cur_topic, section, section, title)
+            cur_level, titled = level, True
             continue
 
-        new_topic = match_topic(line) if line.strip() else None
-        if new_topic and topic is None and (cur_sections or cur_topic is None):
-            if cur_sections:
-                flush()
-                cur_sections = {}
-            cur_topic = new_topic
-            cur_label = None
+        # Inside a titled reply, e.g. "Endocarditis – Aetiology and classification", sub-headings
+        # like "Classification" or "Causes" belong to that card unless they are a level higher.
+        if kind == "section" and titled and level >= cur_level:
+            kind = None
+
+        if kind == "section" and can_switch:
+            _, level, section, inline, heading = c
+            cur_chunk = open_chunk(cur_topic, section, heading)
+            if inline:
+                cur_chunk["lines"].append(inline)
+            cur_level, titled = level, False
             continue
 
-        if cur_label:
-            cur_sections[cur_label][-1][1].append(line)
+        if kind == "topic":
+            _, level, t = c
+            starts_topic = (
+                level == 0                                            # "Topic: X"
+                or cur_level is None                                  # title before any section
+                or (level < PLAIN_LEVEL and level < cur_level)        # "# X" above "## Section"
+            )
+            if starts_topic:
+                if topic is None:
+                    cur_topic = t
+                cur_chunk, cur_level, titled = None, None, False
+                continue
+
+        if cur_chunk is not None:
+            cur_chunk["lines"].append(line)
         elif line.strip():
             preamble.append(line.strip())
 
-    flush()
-
-    # No title anywhere: fall back to the first preamble line if it is short.
-    if results and results[0][0] is None and preamble and len(preamble[0]) <= 80:
-        results[0] = (_clean_title(preamble[0]), results[0][1])
+    # Sections with no title anywhere: use a short first line as the topic.
+    if None in results:
+        guess = _clean(preamble[0]) if preamble and len(preamble[0]) <= 80 else None
+        results = {(guess if k is None else k): v for k, v in results.items()}
     return results
 
 
 def _tidy(lines):
-    # drop leading/trailing blanks and markdown rules, collapse blank runs
-    lines = [l for l in lines if not re.match(r"^\s*([-*_]\s*){3,}$", l)]
+    lines = [l for l in lines if not re.match(r"^\s*([-*_]\s*){3,}$", l)]  # "---" rules
     while lines and not lines[0].strip():
         lines.pop(0)
     while lines and not lines[-1].strip():
@@ -233,10 +285,10 @@ def _tidy(lines):
     return out
 
 
-# ---------------------------------------------------------------------------
-# Markdown-ish -> Anki HTML
-# ---------------------------------------------------------------------------
-_BULLET_RE = re.compile(r"^(\s*)(?:[-*+•▪●]|\d+[.)])\s+(.*)$")
+# ===========================================================================
+# Markdown -> Anki HTML
+# ===========================================================================
+_LIST_RE = re.compile(r"^(\s*)(?:[-*+•▪●]|(\d+)[.)])\s+(.*)$")
 
 
 def _inline(s):
@@ -247,19 +299,41 @@ def _inline(s):
     return s
 
 
+def _table(rows):
+    cells = [[c.strip() for c in r.strip().strip("|").split("|")] for r in rows]
+    cells = [r for r in cells if not all(re.match(r"^:?-{2,}:?$", c) for c in r if c)]
+    if not cells:
+        return ""
+    out = ["<table border=\"1\" style=\"border-collapse:collapse\">"]
+    for i, r in enumerate(cells):
+        tag = "th" if i == 0 and len(rows) > 1 and re.match(r"^\s*\|?\s*:?-{2,}", rows[1]) else "td"
+        out.append("<tr>" + "".join("<%s>%s</%s>" % (tag, _inline(c), tag) for c in r) + "</tr>")
+    out.append("</table>")
+    return "".join(out)
+
+
 def to_html(lines):
-    out = []
-    stack = []  # list of (indent, tag)
+    out, stack, table = [], [], []  # stack of (indent, tag)
 
     def close_to(indent):
         while stack and stack[-1][0] >= indent:
             out.append("</%s>" % stack.pop()[1])
 
+    def flush_table():
+        if table:
+            out.append(_table(table))
+            del table[:]
+
     for line in lines:
-        m = _BULLET_RE.match(line)
+        if line.strip().startswith("|"):
+            close_to(-1)
+            table.append(line)
+            continue
+        flush_table()
+        m = _LIST_RE.match(line)
         if m:
             indent = len(m.group(1).expandtabs(4))
-            tag = "ol" if re.match(r"\s*\d", line) else "ul"
+            tag = "ol" if m.group(2) else "ul"
             if stack and indent < stack[-1][0]:
                 close_to(indent + 1)
             if stack and stack[-1][0] == indent and stack[-1][1] != tag:
@@ -267,56 +341,60 @@ def to_html(lines):
             if not stack or indent > stack[-1][0]:
                 out.append("<%s>" % tag)
                 stack.append((indent, tag))
-            out.append("<li>%s</li>" % _inline(m.group(2)))
-        else:
-            close_to(-1)
-            if not line.strip():
-                out.append("<br>")
-            else:
-                md = re.match(r"^\s*#{1,6}\s+(.*)$", line)
-                text = "<b>%s</b>" % _inline(md.group(1)) if md else _inline(line.strip())
-                out.append(text + "<br>")
+            out.append("<li>%s</li>" % _inline(m.group(3)))
+            continue
+        close_to(-1)
+        if not line.strip():
+            out.append("<br>")
+            continue
+        md = re.match(r"^\s*#{1,6}\s+(.*)$", line)
+        out.append(("<b>%s</b>" % _inline(md.group(1).strip("*_ ")) if md else _inline(line.strip())) + "<br>")
     close_to(-1)
+    flush_table()
     result = "".join(out)
-    result = re.sub(r"(<br>)+$", "", result)
+    result = re.sub(r"(<br>)+(?=<(?:ul|ol|table))", "", result)
     result = re.sub(r"(<br>){3,}", "<br><br>", result)
-    return result
+    return re.sub(r"(<br>)+$", "", result)
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # Cards
-# ---------------------------------------------------------------------------
-def build_cards(text, topic=None, front_template=DEFAULT_FRONT_TEMPLATE, html_out=True):
+# ===========================================================================
+def build_cards(text, topic=None, front_template=FRONT_TEMPLATE, title_on_back=INCLUDE_TITLE_ON_BACK,
+                default_topic=None):
+    """default_topic is used when the text names no disease, e.g. a reply titled just "Diagnosis"."""
     cards = []
-    order = [label for label, _ in SECTIONS]
-    for t, sections in parse(text, topic):
-        t = t or "Untitled"
-        for label in order:
-            if label not in sections:
-                continue
-            chunks = [(h, _tidy(lines)) for h, lines in sections[label]]
-            chunks = [(h, lines) for h, lines in chunks if lines]
+    for t, sections in parse(text, topic).items():
+        t = t or default_topic or "Untitled"
+        ordered = sorted(sections, key=lambda s: SECTION_ORDER.index(s) if s in SECTION_ORDER else 99)
+        for section in ordered:
+            chunks = [dict(c, lines=_tidy(c["lines"])) for c in sections[section]]
+            chunks = [c for c in chunks if c["lines"]]
             if not chunks:
                 continue
-            if len(chunks) == 1:
-                body = chunks[0][1]
-            else:  # e.g. separate "Signs and Symptoms" and "Physical Exam" headings
-                body = []
-                for h, lines in chunks:
-                    body += (["", "**%s**" % h] if body else ["**%s**" % h]) + lines
-            back = to_html(body) if html_out else "\n".join(body)
+            body = []
+            for c in chunks:
+                head = c["title"] if c["title"] and title_on_back else None
+                if len(chunks) > 1 and not head:
+                    head = c["heading"]
+                if head:
+                    body += ([""] if body else []) + ["### " + head]
+                elif body:
+                    body.append("")
+                body += c["lines"]
             cards.append({
                 "topic": t,
-                "section": label,
-                "front": front_template.format(topic=t, section=label),
-                "back": back,
+                "section": section,
+                "front": front_template.format(topic=t, section=section),
+                "back": to_html(body),
+                "titled": any(c["title"] for c in chunks),
             })
     return cards
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # AnkiConnect
-# ---------------------------------------------------------------------------
+# ===========================================================================
 class AnkiError(Exception):
     pass
 
@@ -329,23 +407,106 @@ def anki(action, url=ANKI_CONNECT_URL, **params):
             resp = json.load(r)
     except (urllib.error.URLError, ConnectionError, OSError) as e:
         raise AnkiError(
-            "Can't reach AnkiConnect at %s (%s).\n"
-            "  -> Is Anki open? Is the AnkiConnect add-on (code 2055492159) installed?" % (url, e)
+            "Can't reach Anki (%s).\n"
+            "  -> Is Anki open? Is the AnkiConnect add-on (code 2055492159) installed?" % e
         )
     if resp.get("error"):
         raise AnkiError(resp["error"])
     return resp.get("result")
 
 
-def send_to_anki(cards, deck, model, front_field, back_field, tags, allow_dupes, url):
-    anki("createDeck", url=url, deck=deck)
+def _deck_key(name):
+    return re.sub(r"[^a-z0-9]+", " ", name.lower()).strip()
+
+
+def find_decks(topic, deck_names, parent=""):
+    """Existing decks whose last part matches the topic, best matches first."""
+    key = _deck_key(topic)
+    leaf = {d: _deck_key(d.split("::")[-1]) for d in deck_names}
+    exact = [d for d in deck_names if leaf[d] == key]
+    if not exact:  # "Infective endocarditis" -> "...::Endocarditis" and the reverse
+        exact = [d for d in deck_names if len(leaf[d]) >= 4 and
+                 (re.search(r"\b%s\b" % re.escape(leaf[d]), key) or re.search(r"\b%s\b" % re.escape(key), leaf[d]))]
+    if parent:
+        under = [d for d in exact if d.lower().startswith(parent.lower() + "::")]
+        exact = under or exact
+    return sorted(exact, key=lambda d: (d.count("::") == 0, len(d)))
+
+
+def _ask(prompt):
+    if not sys.stdin or not sys.stdin.isatty():
+        return ""
+    try:
+        return input(prompt).strip()
+    except EOFError:
+        return ""
+
+
+class DeckResolver:
+    """Finds (or asks once for) the deck each topic's cards go into."""
+
+    def __init__(self, fixed_deck, parent, url):
+        self.fixed, self.parent, self.url = fixed_deck, parent, url
+        self.cache = {}
+
+    def __call__(self, topic):
+        if self.fixed:
+            return self.fixed
+        if topic in self.cache:
+            return self.cache[topic]
+        names = anki("deckNames", url=self.url)
+        matches = find_decks(topic, names, self.parent)
+        if len(matches) == 1:
+            deck = matches[0]
+        elif len(matches) > 1:
+            print("  Several decks match %r:" % topic)
+            for i, d in enumerate(matches, 1):
+                print("    %d) %s" % (i, d))
+            choice = _ask("  Which one? [1] ")
+            deck = matches[int(choice) - 1] if choice.isdigit() and 0 < int(choice) <= len(matches) else matches[0]
+        elif self.parent:
+            deck = "%s::%s" % (self.parent, topic)
+            print("  New subdeck: %s" % deck)
+        else:
+            typed = _ask("  No deck called %r yet. Parent deck to create it in "
+                         "(e.g. Internal Medicine::Cardiology), or Enter for top level: " % topic)
+            deck = "%s::%s" % (typed, topic) if typed else topic
+            print("  New deck: %s" % deck)
+        self.cache[topic] = deck
+        return deck
+
+
+def _search_escape(s):
+    return re.sub(r'([\\"*_:])', r"\\\1", s)
+
+
+def pick_model(model, url=ANKI_CONNECT_URL):
+    """Use the requested note type, or fall back to Basic if this Anki profile doesn't have it."""
+    names = anki("modelNames", url=url)
+    if model in names:
+        return model
+    if "Basic" in names:
+        print("  Note type %r not found - using 'Basic'." % model)
+        return "Basic"
+    raise AnkiError("Note type %r not found (you have: %s). Change NOTE_TYPE at the top of the script."
+                    % (model, ", ".join(names)))
+
+
+def send_to_anki(cards, resolve_deck, model, front_field, back_field, tags,
+                 allow_dupes=False, update=False, url=ANKI_CONNECT_URL):
+    model = pick_model(model, url)
     fields = anki("modelFieldNames", url=url, modelName=model)
     for f in (front_field, back_field):
         if f not in fields:
-            raise AnkiError("Note type %r has no field %r (it has: %s). Use --model/--front-field/--back-field."
-                            % (model, f, ", ".join(fields)))
-    added, skipped = 0, []
+            raise AnkiError("Note type %r has no field %r (it has: %s). Change NOTE_TYPE / FRONT_FIELD / "
+                            "BACK_FIELD at the top of the script." % (model, f, ", ".join(fields)))
+    added, updated, skipped = 0, 0, []
+    made = set()
     for c in cards:
+        deck = resolve_deck(c["topic"])
+        if deck not in made:
+            anki("createDeck", url=url, deck=deck)  # no-op if it exists
+            made.add(deck)
         note = {
             "deckName": deck,
             "modelName": model,
@@ -356,25 +517,35 @@ def send_to_anki(cards, deck, model, front_field, back_field, tags, allow_dupes,
         try:
             anki("addNote", url=url, note=note)
             added += 1
-            print("  + %s" % c["front"])
+            print("  + %-45s -> %s" % (c["front"], deck))
         except AnkiError as e:
+            if "duplicate" in str(e).lower() and update:
+                q = '"deck:%s" "%s:%s"' % (_search_escape(deck), front_field, _search_escape(c["front"]))
+                ids = anki("findNotes", url=url, query=q)
+                for nid in ids:
+                    anki("updateNoteFields", url=url, note={"id": nid, "fields": {back_field: c["back"]}})
+                if ids:
+                    updated += 1
+                    print("  ~ %-45s -> %s (updated)" % (c["front"], deck))
+                    continue
+            reason = "already in this deck - use --update to replace it" if "duplicate" in str(e).lower() else e
             skipped.append((c["front"], str(e)))
-            print("  ! %s  (%s)" % (c["front"], e))
-    return added, skipped
+            print("  ! %-45s    skipped: %s" % (c["front"], reason))
+    return added, updated, skipped
 
 
 def write_tsv(cards, path, tags, deck):
-    tag_str = " ".join(tags)
     with open(path, "w", encoding="utf-8", newline="") as f:
-        f.write("#separator:tab\n#html:true\n#deck:%s\n#tags column:3\n" % deck)
+        f.write("#separator:tab\n#html:true\n#notetype:%s\n#deck column:3\n#tags column:4\n" % NOTE_TYPE)
         for c in cards:
-            row = [c["front"], c["back"], tag_str]
+            d = deck or ("%s::%s" % (PARENT_DECK, c["topic"]) if PARENT_DECK else c["topic"])
+            row = [c["front"], c["back"], d, " ".join(tags)]
             f.write("\t".join(x.replace("\t", " ").replace("\n", "<br>") for x in row) + "\n")
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # Clipboard
-# ---------------------------------------------------------------------------
+# ===========================================================================
 _tk_root = None
 
 
@@ -398,43 +569,60 @@ def get_clipboard():
     raise RuntimeError("Couldn't read the clipboard (install tkinter, or xclip/wl-paste on Linux).")
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # CLI
-# ---------------------------------------------------------------------------
-def preview(cards):
+# ===========================================================================
+def looks_like_answer(text, cards, min_sections):
+    """In watch mode, only react to copies that are clearly a section answer."""
+    if any(c["titled"] for c in cards) or len(cards) >= min_sections:
+        return True
+    first = next((l for l in text.splitlines() if l.strip()), "")
+    c = classify(first)
+    return bool(cards) and c is not None and c[0] in ("section", "combined")
+
+
+def preview(cards, resolve_deck=None):
     for c in cards:
         print("=" * 70)
+        print("DECK: ", resolve_deck(c["topic"]) if resolve_deck else "(%s)" % c["topic"])
         print("FRONT:", c["front"])
         print("BACK: ", c["back"])
     print("=" * 70)
     print("%d card(s)" % len(cards))
 
 
-def process(text, args):
-    cards = build_cards(text, args.topic, args.front)
+def process(text, args, resolver, cards=None):
+    if cards is None:
+        cards = build_cards(text, args.topic, args.front, not args.no_title)
     if not cards:
-        print("No sections found. Expected headings like 'Definition', 'Etiology', 'Diagnosis'...")
+        print("No sections found. Expected a title like 'Endocarditis – Definition' or headings like "
+              "'Definition', 'Aetiology', 'Diagnosis'...")
         return 0
-    topics = sorted({c["topic"] for c in cards})
-    print("Found %d card(s) for: %s" % (len(cards), ", ".join(topics)))
     if args.dry_run:
-        preview(cards)
+        preview(cards, resolver if args.deck else None)
         return len(cards)
+    if not args.deck and any(c["topic"] == "Untitled" for c in cards):
+        print("  Not added: can't tell which disease this is. Give it with --topic \"Endocarditis\".")
+        return 0
     if args.tsv:
         write_tsv(cards, args.tsv, args.tags, args.deck)
-        print("Wrote %s - import it in Anki with File > Import (deck %r)." % (args.tsv, args.deck))
+        print("Wrote %d card(s) to %s - import it in Anki with File > Import." % (len(cards), args.tsv))
         return len(cards)
-    added, skipped = send_to_anki(cards, args.deck, args.model, args.front_field, args.back_field,
-                                  args.tags, args.allow_duplicates, args.url)
-    print("Added %d card(s) to %r%s." % (added, args.deck,
-                                         ", skipped %d" % len(skipped) if skipped else ""))
-    return added
+    added, updated, skipped = send_to_anki(cards, resolver, args.model, args.front_field, args.back_field,
+                                           args.tags, args.allow_duplicates, args.update, args.url)
+    parts = ["added %d" % added]
+    if updated:
+        parts.append("updated %d" % updated)
+    if skipped:
+        parts.append("skipped %d" % len(skipped))
+    print("  Done: %s." % ", ".join(parts))
+    return added + updated
 
 
-def watch(args):
-    print("Watching the clipboard. Copy a ChatGPT answer and its cards go into %r." % args.deck)
+def watch(args, resolver):
+    print("Watching the clipboard - click Copy under a ChatGPT reply and its card goes into Anki.")
     print("Press Ctrl-C to stop.\n")
-    last = None
+    last_topic = args.topic
     try:
         last = get_clipboard()  # ignore whatever was already copied
     except RuntimeError as e:
@@ -443,43 +631,55 @@ def watch(args):
         try:
             time.sleep(args.interval)
             text = get_clipboard()
-            if text and text != last:
-                last = text
-                if len(build_cards(text, args.topic, args.front)) >= args.min_sections:
-                    print(time.strftime("[%H:%M:%S] ") + "New ChatGPT answer detected")
-                    try:
-                        process(text, args)
-                    except AnkiError as e:
-                        print("  Error: %s" % e)
-                    print()
+            if not text or text == last:
+                continue
+            last = text
+            cards = build_cards(text, args.topic, args.front, not args.no_title, default_topic=last_topic)
+            if cards and looks_like_answer(text, cards, args.min_sections):
+                if cards[-1]["topic"] != "Untitled":
+                    last_topic = cards[-1]["topic"]
+                print(time.strftime("[%H:%M:%S] ") + "Copied: %s" %
+                      ", ".join("%s - %s" % (c["topic"], c["section"]) for c in cards))
+                if any(c["topic"] == "Untitled" for c in cards):
+                    print("  (no disease name in this reply - use --topic, or copy a titled reply first)")
+                try:
+                    process(text, args, resolver, cards)
+                except AnkiError as e:
+                    print("  Error: %s" % e)
+                print()
         except KeyboardInterrupt:
             print("\nStopped.")
             return
 
 
 def main(argv=None):
-    p = argparse.ArgumentParser(description="Turn ChatGPT answers into one Anki card per section.")
-    p.add_argument("file", nargs="?", help="text/markdown file (default: paste into stdin)")
-    p.add_argument("-d", "--deck", default=DEFAULT_DECK, help="Anki deck, e.g. 'Medicine::Cardio' (created if missing)")
-    p.add_argument("-t", "--topic", help="topic name for the card fronts (default: taken from the answer's title)")
-    p.add_argument("-c", "--clipboard", action="store_true", help="read the answer from the clipboard")
-    p.add_argument("-w", "--watch", action="store_true", help="keep watching the clipboard and add cards automatically")
-    p.add_argument("--interval", type=float, default=1.0, help="clipboard poll interval in seconds (watch mode)")
-    p.add_argument("--min-sections", type=int, default=2, help="sections needed before watch mode treats a copy as an answer")
+    p = argparse.ArgumentParser(description="Turn ChatGPT answers into Anki cards, one card per section.")
+    p.add_argument("file", nargs="?", help="text/markdown file (default: paste into the terminal)")
+    p.add_argument("-w", "--watch", action="store_true", help="keep watching the clipboard and add cards as you copy")
+    p.add_argument("-c", "--clipboard", action="store_true", help="add what is on the clipboard now")
+    p.add_argument("-d", "--deck", help="put every card in this exact deck (default: find the disease's subdeck)")
+    p.add_argument("-p", "--parent", "--parent-deck", dest="parent_deck", default=PARENT_DECK,
+                   help="where new disease subdecks are created, e.g. 'Internal Medicine::Cardiology'")
+    p.add_argument("-t", "--topic", help="disease name (default: read from the reply's title)")
     p.add_argument("-n", "--dry-run", action="store_true", help="show the cards, send nothing")
+    p.add_argument("--update", action="store_true", help="if a card with the same front exists in the deck, replace its back")
+    p.add_argument("--allow-duplicates", action="store_true", help="add even if the same front already exists in the deck")
     p.add_argument("--tsv", metavar="PATH", help="write an Anki import file instead of using AnkiConnect")
-    p.add_argument("--model", default=DEFAULT_MODEL, help="note type (default: Basic)")
-    p.add_argument("--front-field", default="Front")
-    p.add_argument("--back-field", default="Back")
-    p.add_argument("--front", default=DEFAULT_FRONT_TEMPLATE, help="card front template, uses {topic} and {section}")
-    p.add_argument("--tags", default="gpt-to-anki", help="space-separated tags")
-    p.add_argument("--allow-duplicates", action="store_true", help="add even if an identical front exists in the deck")
-    p.add_argument("--url", default=ANKI_CONNECT_URL, help="AnkiConnect URL")
+    p.add_argument("--front", default=FRONT_TEMPLATE, help="front template using {section} and {topic} (default: %(default)s)")
+    p.add_argument("--no-title", action="store_true", help="don't put the 'Disease – Section' title on the back")
+    p.add_argument("--model", default=NOTE_TYPE, help="note type (default: %(default)s)")
+    p.add_argument("--front-field", default=FRONT_FIELD)
+    p.add_argument("--back-field", default=BACK_FIELD)
+    p.add_argument("--tags", default=TAGS, help="space-separated tags")
+    p.add_argument("--interval", type=float, default=0.7, help=argparse.SUPPRESS)
+    p.add_argument("--min-sections", type=int, default=2, help=argparse.SUPPRESS)
+    p.add_argument("--url", default=ANKI_CONNECT_URL, help=argparse.SUPPRESS)
     args = p.parse_args(argv)
     args.tags = args.tags.split()
+    resolver = DeckResolver(args.deck, args.parent_deck.strip(": "), args.url)
 
     if args.watch:
-        watch(args)
+        watch(args, resolver)
         return 0
 
     if args.file:
@@ -494,7 +694,7 @@ def main(argv=None):
         text = sys.stdin.read()
 
     try:
-        process(text, args)
+        process(text, args, resolver)
     except AnkiError as e:
         print("Error: %s" % e, file=sys.stderr)
         return 1

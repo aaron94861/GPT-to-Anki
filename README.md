@@ -1,95 +1,97 @@
 # GPT-to-Anki
 
-Copy a ChatGPT answer, get one Anki card per section, filed in the deck you choose.
+Click **Copy** under a ChatGPT reply, and the card appears in the right Anki subdeck. You never open Anki's Add window.
+
+## Before and after
+
+**Before (per section, 6 times per disease):**
+ChatGPT → Project (Cardiology) → chat (Endocarditis) → copy the reply → Anki → find the
+Internal Medicine::Cardiology::Endocarditis deck → Browse → Notes → Add Notes → type "Definition?" →
+paste the back → Add → back to ChatGPT …
+
+**After:**
 
 ```
-ChatGPT answer                         Anki deck "Medicine::GI"
-# Acute Pancreatitis                   ┌──────────────────────────────────────────────┐
-## Definition         ───────────────▶ │ Front: Acute Pancreatitis - Definition       │
-## Etiology           ───────────────▶ │ Front: Acute Pancreatitis - Etiology         │
-## Pathogenesis       ───────────────▶ │ Front: Acute Pancreatitis - Pathogenesis     │
-## Physical Exam & S/S ──────────────▶ │ Front: ... - Physical Examination & Signs... │
-## Diagnosis          ───────────────▶ │ Front: Acute Pancreatitis - Diagnosis        │
-## Management & Tx    ───────────────▶ │ Front: ... - Management & Treatment          │
-                                       └──────────────────────────────────────────────┘
+ChatGPT reply "Endocarditis – Definition"   ── click Copy ──▶  Anki: Internal Medicine::Cardiology::Endocarditis
+                                                                  Front: Definition?
+                                                                  Back:  the reply (formatting kept)
+ChatGPT reply "Endocarditis – Aetiology…"   ── click Copy ──▶     Front: Aetiology and classification?
+...
 ```
 
-**Before:** copy one section → open Anki → Add → choose deck → type front → paste back → repeat 6× per disease.
-**After:** copy the whole ChatGPT answer → 6 cards are in Anki.
+The script reads the disease name and the section from the reply's title, finds the subdeck that already
+exists in Anki (or creates one under your parent deck), and adds the card using your
+**Syllabus Topic Prompt** note type.
 
-## One-time setup
+| ChatGPT reply about… | Card front |
+| --- | --- |
+| Definition | `Definition?` |
+| Aetiology / Classification / Causes / Risk factors | `Aetiology and classification?` |
+| Pathogenesis / Pathophysiology | `Pathogenesis?` |
+| Physical examination / Signs and symptoms / Clinical features | `Physical examination and signs and symptoms?` |
+| Diagnosis / Investigations / Workup | `Diagnosis?` |
+| Management / Treatment | `Management and treatment?` |
 
-1. **Python 3.8+**: https://www.python.org/downloads/ (on Windows, tick "Add Python to PATH").
-2. **AnkiConnect add-on**: in Anki, go to *Tools → Add-ons → Get Add-ons…*, enter code `2055492159`, then restart Anki.
-3. **ChatGPT project instructions**: paste the block from
-   [`CHATGPT_PROJECT_INSTRUCTIONS.md`](CHATGPT_PROJECT_INSTRUCTIONS.md) into your ChatGPT project's
-   instructions so every answer uses the same six headings.
-4. Download `gpt_to_anki.py` (no extra packages needed).
+## One-time setup (Windows)
 
-Keep Anki open while you use the script.
+1. **Install Python** from https://www.python.org/downloads/ and tick **"Add Python to PATH"** during setup.
+2. **Install AnkiConnect**: in Anki, go to *Tools → Add-ons → Get Add-ons…*, enter `2055492159`, then restart Anki.
+3. **Download this folder** (green *Code* button → *Download ZIP*) and unzip it somewhere, e.g. your Documents.
+4. Optional: paste [`CHATGPT_PROJECT_INSTRUCTIONS.md`](CHATGPT_PROJECT_INSTRUCTIONS.md) into each ChatGPT project's
+   instructions. This keeps reply titles in the "Disease – Section" form the script reads.
 
-## Using it
+## Daily use
 
-### Fastest: watch mode (copy and you're done)
+1. Open Anki.
+2. Double-click **`Watch Cardiology.bat`**. A black window opens; leave it open.
+3. In ChatGPT, open the disease chat and click **Copy** under each reply (Definition, Aetiology, …).
+   For each copy, the window shows something like:
+   ```
+   [19:42:10] Copied: Endocarditis - Definition
+     + Definition?                    -> Internal Medicine::Cardiology::Endocarditis
+   ```
+4. Close the window when you're done.
 
-```bash
-python gpt_to_anki.py --watch --deck "Medicine::GI"
+**Other projects:** copy `Watch Cardiology.bat`, rename it (e.g. `Watch Endocrinology.bat`), and change the
+`PARENT=` line inside. The parent is only used to create subdecks for **new** diseases; diseases that already
+have a subdeck are found wherever it is.
+
+**Notes:**
+- If a reply has no disease name in its title (just "Diagnosis"), the card uses the disease from your previous copy.
+- If the subdeck already has that front (e.g. "Diagnosis?"), the card is **skipped**, so copying twice is harmless.
+  To replace the old card's back instead, run with `--update`.
+- Ordinary copies (a sentence, a word) are ignored.
+
+## Other ways to run it
+
+```bat
+py gpt_to_anki.py --clipboard                       :: add the reply that's on the clipboard, once
+py gpt_to_anki.py answer.md --dry-run               :: preview cards, add nothing
+py gpt_to_anki.py --watch --deck "Some::Deck"       :: put every card in one exact deck
+py gpt_to_anki.py answer.md --tsv cards.tsv         :: make a file for Anki's File > Import
 ```
 
-Leave it running. In ChatGPT, click the **Copy** button under an answer, and the cards are added within a
-second. Copy the next answer, and those cards are added too. Ordinary copies, like a single word, are
-ignored: a copy has to contain at least 2 recognised section headings.
+(On Mac/Linux use `python3` instead of `py`.)
 
-### One answer at a time
+| Option | What it does |
+| --- | --- |
+| `-w, --watch` | Keep watching the clipboard |
+| `-p, --parent` | Where new disease subdecks are created, e.g. `"Internal Medicine::Cardiology"` |
+| `-d, --deck` | Put every card in this exact deck instead |
+| `-t, --topic` | Disease name, if the replies don't contain it |
+| `--update` | Replace the back of an existing card with the same front |
+| `--no-title` | Leave the "Endocarditis – Definition" heading off the back |
+| `--front` | Front template, default `{section}?`; e.g. `"{topic} – {section}?"` |
+| `--model` | Note type, default `Syllabus Topic Prompt` (falls back to `Basic` if missing) |
+| `-n, --dry-run` | Show the cards without adding them |
 
-```bash
-python gpt_to_anki.py --clipboard --deck "Medicine::GI"     # use what's on the clipboard
-python gpt_to_anki.py --deck "Medicine::GI"                 # paste into the terminal, then Ctrl-D (Mac/Linux) / Ctrl-Z Enter (Windows)
-python gpt_to_anki.py answer.md --deck "Medicine::GI"       # from a saved file
-```
+To set defaults permanently (parent deck, note type, tags), or to rename or add card types, edit the
+**YOUR SETTINGS** block at the top of `gpt_to_anki.py`.
 
-### Check before adding
+## Also works with one big reply
 
-```bash
-python gpt_to_anki.py examples/sample_chatgpt_answer.md --dry-run
-```
-
-### No AnkiConnect? Make an import file
-
-```bash
-python gpt_to_anki.py answer.md --deck "Medicine::GI" --tsv cards.tsv
-```
-
-Then in Anki use *File → Import → cards.tsv*.
-
-## Options
-
-| Option | What it does | Default |
-| --- | --- | --- |
-| `-d, --deck` | Deck to add to (created if missing). Use `::` for subdecks. | `Default` |
-| `-t, --topic` | Override the disease name on the card fronts | taken from the `# Title` |
-| `--front` | Front text template, using `{topic}` and `{section}` | `{topic} - {section}` |
-| `--tags` | Space-separated tags | `gpt-to-anki` |
-| `--model` / `--front-field` / `--back-field` | Use another note type | `Basic` / `Front` / `Back` |
-| `--allow-duplicates` | Add the card even if the same front already exists in the deck | off (skips duplicates) |
-| `-n, --dry-run` | Show the cards without adding them | |
-| `--tsv PATH` | Write an import file instead of using AnkiConnect | |
-
-Example: question-style fronts:
-`--front "What is the {section} of {topic}?"`
-
-## What the parser understands
-
-- Headings in any of these forms: `## Definition`, `**Definition**`, `**Definition:** text…`, `1. Definition`, `Definition: text…`
-- Common synonyms: *Pathophysiology* → Pathogenesis, *Causes / Risk factors* → Etiology,
-  *Clinical presentation / Signs and Symptoms / Physical Exam* → Physical Examination & Signs and Symptoms,
-  *Workup / Investigations* → Diagnosis, *Treatment / Management* → Management & Treatment.
-  When an answer has separate *Signs and Symptoms* and *Physical Exam* headings, both go on one card under bold sub-headings.
-- Several diseases in one paste (each starting with its own `# Title`)
-- Bullets, numbered lists, **bold**, and *italics* are kept as formatting on the card.
-
-To add, rename, or split cards (for example, a *Complications* card), edit the `SECTIONS` list at the top of
-`gpt_to_anki.py`.
+If you ask ChatGPT for every section in one reply (one `# Disease` title with a `## Section` heading per
+section), a single copy makes all six cards. See `examples/all_sections_in_one_reply.md`.
 
 ## Tests
 
