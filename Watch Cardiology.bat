@@ -7,6 +7,6 @@ set "PARENT=Internal Medicine::Cardiology"
 cd /d "%~dp0"
 set "PY=python"
 where py >nul 2>nul
-if not errorlevel 1 set "PY=py"
+if not errorlevel 1 set "PY=py -3"
 %PY% gpt_to_anki.py --watch --parent "%PARENT%"
 pause

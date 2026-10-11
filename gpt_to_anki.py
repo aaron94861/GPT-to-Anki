@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 gpt_to_anki.py - turn ChatGPT answers into Anki cards, one card per section.
 
